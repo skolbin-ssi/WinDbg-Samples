@@ -49,13 +49,16 @@ namespace GdbSrvControllerLib
         std::wstring agentNamePacket;   //  Agent name
         std::wstring uuid;              //  Class identifier.
         bool fDisplayCommPackets;       //  Flag if set then we display the communication packets characters.
-        bool fDebuggerSessionByCore;	//	Flag if set then we do debug only by core processor, so step and continue
-                                        //	commands happen only on one core at the time. If not set then we 
-                                        //	let all cores run when we do step/continue commands.
+        bool fDebuggerSessionByCore;    //  Flag if set then we do debug only by core processor, so step and continue
+                                        //  commands happen only on one core at the time. If not set then we 
+                                        //  let all cores run when we do step/continue commands.
         bool fExceptionThrowEnabled;    //  Allow throwing exception by the Exdi COM server.
                                         //  Used to disallow throwing exceptions when memory failures occur.
         std::wstring qSupportedPacket;  //  GDB server supported, if this empty then will send the default "qsupported" packet
         bool fTreatSwBpAsHwBp;          //  GDB server client will convert SW bp as HW bp.
+        bool fForcedLegacyResumeStepCommands; //  Flag if set the GDB server will use the legacy resume/step command mode
+        bool fPAMemoryAccess;           //  GDB server reuires memory access via PA
+        bool fgdbMonitorCmdDoNotWaitOnOK; //  Flag if set then the GDB monitor response processing won't wait on the "OK" string
     } ConfigExdiData;
 
     //  This type indicates the Target data.
@@ -231,6 +234,7 @@ namespace GdbSrvControllerLib
         static inline bool IsRegisterFileReference(_In_ PCWSTR pTagName);
         static inline bool IsFeatureRegisterFile(_In_ PCWSTR pTagName);
         static inline bool IsRegisterFileEntry(_In_ PCWSTR pTagName);
+        static inline bool IsTargetEmptyAttribute(_In_ PCWSTR pTagName);
         static bool SetFileTargetArchitecture(_In_ PCWSTR pTagValue, _Out_ ConfigExdiGdbSrvData* pConfigTable);
         static bool SetRegistersByTargetFile(_In_ TAG_ATTR_LIST* const pTagAttrList,
             _Out_ ConfigExdiGdbSrvData* pConfigTable);

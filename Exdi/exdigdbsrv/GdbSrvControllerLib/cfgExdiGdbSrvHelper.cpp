@@ -204,6 +204,11 @@ class ConfigExdiGdbServerHelper::ConfigExdiGdbServerHelperImpl
         return m_ExdiGdbServerData.component.fExceptionThrowEnabled;
     }
 
+    inline bool ConfigExdiGdbServerHelperImpl::IsForcedLegacyResumeStepMode()
+    {
+        return m_ExdiGdbServerData.component.fForcedLegacyResumeStepCommands;
+    }
+
     inline TargetArchitecture ConfigExdiGdbServerHelperImpl::GetLastGdbServerRegisterArchitecture() const 
     {
         return m_ExdiGdbServerData.gdbServerRegisters.registerSet.back();
@@ -332,6 +337,16 @@ class ConfigExdiGdbServerHelper::ConfigExdiGdbServerHelperImpl
     inline bool ConfigExdiGdbServerHelperImpl::GetTreatSwBpAsHwBp() const
     {
         return m_ExdiGdbServerData.component.fTreatSwBpAsHwBp;
+    }
+
+    inline bool ConfigExdiGdbServerHelperImpl::GetServerRequirePAMemoryAccess() const
+    {
+        return m_ExdiGdbServerData.component.fPAMemoryAccess;
+    }
+
+    inline bool ConfigExdiGdbServerHelperImpl::IsGdbMonitorCmdDoNotWaitOnOKEnable()
+    {
+        return m_ExdiGdbServerData.component.fgdbMonitorCmdDoNotWaitOnOK;
     }
 
     private:
@@ -740,6 +755,12 @@ bool ConfigExdiGdbServerHelper::IsExceptionThrowEnabled()
     return m_pConfigExdiGdbServerHelperImpl->IsExceptionThrowEnabled();
 }
 
+bool ConfigExdiGdbServerHelper::IsForcedLegacyResumeStepMode()
+{
+    assert(m_pConfigExdiGdbServerHelperImpl != nullptr);
+    return m_pConfigExdiGdbServerHelperImpl->IsForcedLegacyResumeStepMode();
+}
+
 void ConfigExdiGdbServerHelper::GetGdbServerRegisters(_Out_ unique_ptr<vector<RegistersStruct>> * spRegisters)
 {
     assert(m_pConfigExdiGdbServerHelperImpl != nullptr);
@@ -867,4 +888,16 @@ void ConfigExdiGdbServerHelper::SetTargetArchitecture(_In_ TargetArchitecture ta
 {
     assert(m_pConfigExdiGdbServerHelperImpl != nullptr);
     m_pConfigExdiGdbServerHelperImpl->SetTargetArchitecture(targetArch);
+}
+
+bool ConfigExdiGdbServerHelper::GetServerRequirePAMemoryAccess()
+{
+    assert(m_pConfigExdiGdbServerHelperImpl != nullptr);
+    return m_pConfigExdiGdbServerHelperImpl->GetServerRequirePAMemoryAccess();
+}
+
+bool ConfigExdiGdbServerHelper::IsGdbMonitorCmdDoNotWaitOnOKEnable()
+{
+    assert(m_pConfigExdiGdbServerHelperImpl != nullptr);
+    return m_pConfigExdiGdbServerHelperImpl->IsGdbMonitorCmdDoNotWaitOnOKEnable();
 }

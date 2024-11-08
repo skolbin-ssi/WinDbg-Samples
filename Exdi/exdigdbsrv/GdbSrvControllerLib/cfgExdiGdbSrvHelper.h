@@ -51,7 +51,9 @@ class ConfigExdiGdbServerHelper final
         void GetGdbServerSystemRegisters(_Out_ unique_ptr<vector<RegistersStruct>>* spSystemRegisters);
         void GetSystemRegistersMapAccessCode(_Out_ unique_ptr<SystemRegistersMapType>* spMapSystemRegs);
         bool GetTreatSwBpAsHwBp();
+        bool GetServerRequirePAMemoryAccess();
         bool IsExceptionThrowEnabled();
+        bool IsForcedLegacyResumeStepMode();
         bool IsSupportedSpecialMemoryCommand();
         bool IsSupportedPhysicalMemoryCommand();
         bool IsSupportedSupervisorMemoryCommand();
@@ -64,6 +66,7 @@ class ConfigExdiGdbServerHelper final
         bool ReadConfigFile(_In_ PCWSTR pXmlConfigFile);
         void SetXmlBufferToParse(_In_ PCWSTR pXmlConfigFile);
         void SetTargetArchitecture(_In_ TargetArchitecture targetArch);
+        bool IsGdbMonitorCmdDoNotWaitOnOKEnable();
 
     private:
         ConfigExdiGdbServerHelper(_In_opt_ PCWSTR pXmlConfigFile);

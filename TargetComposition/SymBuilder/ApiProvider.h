@@ -52,7 +52,14 @@ public:
     // to a BaseTypeSymbol.  Note that no reference count is returned on the resulting pointer.  It is valid
     // solely by the fact that it is in the global symbol table of the symbol set.
     //
-    BaseTypeSymbol *UnboxType(_In_ SymbolSet *pSymbolSet, _In_ Object typeObject, _In_ bool allowAutoCreations = true);
+    // Note: If 'pBitFieldLength' is non-zero and the typeObject is a string, it will accept strings like
+    //       "int :3" where the returned type is "int" but *pBitFieldLength is set to 3.  If pBitFieldLength
+    //       is nullptr, typeObject as a string *CANNOT* validly contain the colon.
+    //
+    BaseTypeSymbol *UnboxType(_In_ SymbolSet *pSymbolSet, 
+                              _In_ Object typeObject, 
+                              _In_ bool allowAutoCreations = true,
+                              _Out_opt_ ULONG64 *pBitFieldLength = nullptr);
 
     // BoxRelatedType():
     //
@@ -228,7 +235,7 @@ private:
     //
     Object Create(_In_ const Object& typesObject, 
                   _In_ ComPtr<SymbolSet>& spSymbolSet,
-                  _In_ std::wstring typeName,
+                  _In_ std::optional<std::wstring> typeName,
                   _In_ std::optional<std::wstring> qualifiedTypeName);
 
     // CreatePointer():
@@ -268,11 +275,20 @@ private:
                       _In_ std::optional<Object> enumBasicType,
                       _In_ std::optional<std::wstring> qualifiedTypeName);
 
+    // FindByName():
+    //
+    // Bound API which will lookup a type by its name.
+    //
+    std::optional<Object> FindByName(_In_ const Object& typesObject,
+                                     _In_ ComPtr<SymbolSet>& spSymbolSet,
+                                     _In_ std::wstring typeName,
+                                     _In_ std::optional<bool> allowCreation);
+
     // GetIterator():
     //
     // Bound generator for iterating over types within a symbol set.
     //
-    std::experimental::generator<Object> GetIterator(_In_ const Object& typesObject,
+    std::experimental::generator<Object> GetIterator(_In_ const Object typesObject,
                                                      _In_ ComPtr<SymbolSet>& spSymbolSet);
 
 };
@@ -428,13 +444,14 @@ private:
                _In_ ComPtr<UdtTypeSymbol>& spUdtTypeSymbol,
                _In_ std::wstring fieldName,
                _In_ Object fieldType,
-               _In_ std::optional<ULONG64> fieldOffset);
+               _In_ size_t argCount,                        // [fieldOffset], [details]
+               _In_reads_(argCount) Object *pArgs);
 
     // GetIterator():
     //
     // Bound generator for iterating over fields within a type.
     //
-    std::experimental::generator<Object> GetIterator(_In_ const Object& fieldsObject,
+    std::experimental::generator<Object> GetIterator(_In_ const Object fieldsObject,
                                                      _In_ ComPtr<UdtTypeSymbol>& spUdtTypeSymbol);
 
 };
@@ -468,7 +485,7 @@ private:
     //
     // Bound generator for iterating over enumerants within an enum.
     //
-    std::experimental::generator<Object> GetIterator(_In_ const Object& enumObject,
+    std::experimental::generator<Object> GetIterator(_In_ const Object enumObject,
                                                      _In_ ComPtr<EnumTypeSymbol>& spEnumTypeSymbol);
 
 
@@ -510,6 +527,30 @@ private:
     std::optional<ULONG64> GetOffset(_In_ const Object& fieldObject, _In_ ComPtr<FieldSymbol>& spFieldSymbol);
     void SetOffset(_In_ const Object& fieldObject, _In_ ComPtr<FieldSymbol>& spFieldSymbol,
                    _In_ ULONG64 fieldOffset);
+
+    // [Get/Set]Value():
+    //
+    // Bound property accessor which returns the value of the field.
+    //
+    std::optional<Object> GetValue(_In_ const Object& fieldObject, _In_ ComPtr<FieldSymbol>& spFieldSymbol);
+    void SetValue(_In_ const Object& fieldObject, _In_ ComPtr<FieldSymbol>& spFieldSymbol,
+                  _In_ Object fieldValue);
+
+    // [Get/Set]BitFieldLength():
+    //
+    // Bound property accessor which returns the bitfield length *IF* the field is a bitfield.
+    //
+    std::optional<ULONG64> GetBitFieldLength(_In_ const Object& fieldObject, _In_ ComPtr<FieldSymbol>& spFieldSymbol);
+    void SetBitFieldLength(_In_ const Object& fieldObject, _In_ ComPtr<FieldSymbol>& spFieldSymbol,
+                           _In_ ULONG64 bitFieldLength);
+
+    // [Get/Set]BitFieldPosition():
+    //
+    // Bound property accessor which returns the bitfield position *IF* the field is a bitfield.
+    //
+    std::optional<ULONG64> GetBitFieldPosition(_In_ const Object& fieldObject, _In_ ComPtr<FieldSymbol>& spFieldSymbol);
+    void SetBitFieldPosition(_In_ const Object& fieldObject, _In_ ComPtr<FieldSymbol>& spFieldSymbol,
+                             _In_ ULONG64 bitFieldPosition);
 
     // Delete():
     //
@@ -564,7 +605,7 @@ private:
     //
     // Bound generator for iterating over fields within a type.
     //
-    std::experimental::generator<Object> GetIterator(_In_ const Object& baseClassesObject,
+    std::experimental::generator<Object> GetIterator(_In_ const Object baseClassesObject,
                                                      _In_ ComPtr<UdtTypeSymbol>& spUdtTypeSymbol);
 
 };
@@ -662,7 +703,7 @@ private:
     //
     // Bound generator for iterating over data within a symbol set.
     //
-    std::experimental::generator<Object> GetIterator(_In_ const Object& dataObject,
+    std::experimental::generator<Object> GetIterator(_In_ const Object dataObject,
                                                      _In_ ComPtr<SymbolSet>& spSymbolSet);
 
 };
@@ -745,7 +786,7 @@ private:
     //
     // Bound generator for iterating over functions within a symbol set.
     //
-    std::experimental::generator<Object> GetIterator(_In_ const Object& functionsObject,
+    std::experimental::generator<Object> GetIterator(_In_ const Object functionsObject,
                                                      _In_ ComPtr<SymbolSet>& spSymbolSet);
 
 };
@@ -827,11 +868,20 @@ private:
                _In_ std::wstring parameterName,
                _In_ Object parameterType);
 
+    // PropagateLiveRangesFromCallingConvention():
+    //
+    // Takes the list of parameters which have been defined and uses knowledge of the calling convention
+    // and the disassembler to walk the code of the function and determine where the parameters are at 
+    // at each given instruciton and add appropriate live ranges.
+    //
+    void PropagateLiveRangesFromCallingConvention(_In_ const Object& parametersObject,
+                                                  _In_ ComPtr<FunctionSymbol>& spFunctionSymbol);
+
     // GetIterator():
     //
     // Bound generator for iterating over parameters within a function.
     //
-    std::experimental::generator<Object> GetIterator(_In_ const Object& parametersObject,
+    std::experimental::generator<Object> GetIterator(_In_ const Object parametersObject,
                                                      _In_ ComPtr<FunctionSymbol>& spFunctionSymbol);
 
     // ToString():
@@ -872,7 +922,7 @@ private:
     //
     // Bound generator for iterating over local variables within a function.
     //
-    std::experimental::generator<Object> GetIterator(_In_ const Object& localVariablesObject,
+    std::experimental::generator<Object> GetIterator(_In_ const Object localVariablesObject,
                                                      _In_ ComPtr<FunctionSymbol>& spFunctionSymbol);
 
 };
@@ -989,7 +1039,7 @@ private:
     //
     // Bound generator for iterating over parameters within a function.
     //
-    std::experimental::generator<Object> GetIterator(_In_ const Object& liveRangesObject,
+    std::experimental::generator<Object> GetIterator(_In_ const Object liveRangesObject,
                                                      _In_ ComPtr<VariableSymbol>& spVariableSymbol);
 };
 
@@ -1082,7 +1132,7 @@ private:
     //
     // Bound generator for iterating over address ranges of the code bytes of a function.
     //
-    std::experimental::generator<Object> GetIterator(_In_ const Object& addressRangesObject,
+    std::experimental::generator<Object> GetIterator(_In_ const Object addressRangesObject,
                                                      _In_ ComPtr<FunctionSymbol>& spFunctionSymbol);
 };
 
@@ -1137,7 +1187,7 @@ private:
     //
     // Bound generator for iterating over public symbols within a symbol set.
     //
-    std::experimental::generator<Object> GetIterator(_In_ const Object& publicsObject,
+    std::experimental::generator<Object> GetIterator(_In_ const Object publicsObject,
                                                      _In_ ComPtr<SymbolSet>& spSymbolSet);
 
 };

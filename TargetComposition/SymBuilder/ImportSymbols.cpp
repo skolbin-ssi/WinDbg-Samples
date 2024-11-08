@@ -582,6 +582,23 @@ HRESULT SymbolImporter_DbgHelp::ImportMemberData(_In_ ULONG symIndex, _Out_ ULON
         return ImportFailure(E_FAIL);
     }
 
+    //
+    // If the underlying field is a bitfield, get its position and field length and ensure that we import 
+    // it as such a bitfield.
+    //
+    ULONG64 bitFieldPosition = 0;
+    ULONG64 bitFieldLength = 0;
+
+    ULONG bitPos;
+    if (SymGetTypeInfo(m_symHandle, m_moduleBase, symIndex, TI_GET_BITPOSITION, &bitPos))
+    {
+        if (!SymGetTypeInfo(m_symHandle, m_moduleBase, symIndex, TI_GET_LENGTH, &bitFieldLength))
+        {
+            return ImportFailure(E_FAIL);
+        }
+        bitFieldPosition = bitPos;
+    }
+
     localstr_ptr spDataName(pDataName);
 
     ULONG64 memberBuilderType;
@@ -593,7 +610,9 @@ HRESULT SymbolImporter_DbgHelp::ImportMemberData(_In_ ULONG symIndex, _Out_ ULON
                                         parentId,
                                         offset,
                                         memberBuilderType,
-                                        pDataName);
+                                        pDataName,
+                                        bitFieldLength,
+                                        bitFieldPosition);
     if (FAILED(hr))
     {
         return ImportFailure(hr);
@@ -657,6 +676,43 @@ HRESULT SymbolImporter_DbgHelp::ImportConstantData(_In_ ULONG symIndex, _Out_ UL
     return hr;
 }
 
+HRESULT SymbolImporter_DbgHelp::ImportGlobalData(_In_ ULONG symIndex, _Out_ ULONG64 *pBuilderId, _In_ ULONG64 parentId)
+{
+    HRESULT hr = S_OK;
+
+    ULONG childTI;
+    WCHAR *pDataName;
+    ULONG64 addr;
+
+    if (!SymGetTypeInfo(m_symHandle, m_moduleBase, symIndex, TI_GET_TYPEID, &childTI) ||
+        !SymGetTypeInfo(m_symHandle, m_moduleBase, symIndex, TI_GET_ADDRESS, &addr) ||
+        !SymGetTypeInfo(m_symHandle, m_moduleBase, symIndex, TI_GET_SYMNAME, &pDataName))
+    {
+        return ImportFailure(E_FAIL);
+    }
+
+    localstr_ptr spDataName(pDataName);
+
+    ULONG64 dataBuilderType;
+    IfFailedReturn(ImportSymbol(childTI, &dataBuilderType));
+
+    ComPtr<GlobalDataSymbol> spGlobalData;
+    hr = MakeAndInitialize<GlobalDataSymbol>(&spGlobalData,
+                                             m_pOwningSet,
+                                             parentId,
+                                             addr - m_moduleBase,       // RVA, not absolute VA
+                                             dataBuilderType,
+                                             pDataName,
+                                             nullptr);
+    if (FAILED(hr))
+    {
+        return ImportFailure(hr);
+    }
+
+    *pBuilderId = spGlobalData->InternalGetId();
+    return hr;
+}
+
 HRESULT SymbolImporter_DbgHelp::ImportDataSymbol(_In_ ULONG symIndex, _Out_ ULONG64 *pBuilderId, _In_ ULONG64 parentId)
 {
     HRESULT hr = S_OK;
@@ -674,6 +730,9 @@ HRESULT SymbolImporter_DbgHelp::ImportDataSymbol(_In_ ULONG symIndex, _Out_ ULON
 
         case DataIsConstant:
             return ImportConstantData(symIndex, pBuilderId, parentId);
+
+        case DataIsGlobal:
+            return ImportGlobalData(symIndex, pBuilderId, parentId);
 
         default:
             //
@@ -855,8 +914,33 @@ HRESULT SymbolImporter_DbgHelp::ImportFunctionType(_In_ ULONG symIndex, _Out_ UL
         return ImportFailure(E_FAIL);
     }
 
+    //
+    // Now that we have some basic information about the function type, go and create the shell of it in the symbol
+    // builder and then copy over return types and parameter types we wish to import one by one.
+    //
+    ComPtr<FunctionTypeSymbol> spFunctionType;
+    hr = MakeAndInitialize<FunctionTypeSymbol>(&spFunctionType, m_pOwningSet);
+    if (FAILED(hr))
+    {
+        return ImportFailure(hr);
+    }
+
+    //
+    // A function type (e.g.: a prototype) may contain references to itself in either the return type of
+    // the function or one of the arguments types to the function (perhaps via some UDT).  In order for those 
+    // functionm types to resolve correctly, we must have this function type in the index
+    // table already so that the linkages can be set up without causing errors or an infinite import chain.
+    //
+    IfFailedReturn(ConvertException([&]()
+    {
+        m_importedIndexMap.insert({ symIndex, spFunctionType->InternalGetId() });
+        return S_OK;
+    }));
+
     ULONG64 funcReturnTypeBuilderId;
     IfFailedReturn(ImportSymbol(funcReturnTypeId, &funcReturnTypeBuilderId));
+
+    spFunctionType->InternalSetReturnType(funcReturnTypeBuilderId);
 
     std::unique_ptr<char []> spBuf(new char[sizeof(TI_FINDCHILDREN_PARAMS) + sizeof(ULONG) * childCount]);
     TI_FINDCHILDREN_PARAMS *pChildQuery = reinterpret_cast<TI_FINDCHILDREN_PARAMS *>(spBuf.get());
@@ -911,16 +995,7 @@ HRESULT SymbolImporter_DbgHelp::ImportFunctionType(_In_ ULONG symIndex, _Out_ UL
         }
     }
 
-    ComPtr<FunctionTypeSymbol> spFunctionType;
-    hr = MakeAndInitialize<FunctionTypeSymbol>(&spFunctionType,
-                                               m_pOwningSet,
-                                               funcReturnTypeBuilderId,
-                                               paramCount,
-                                               paramCount == 0 ? nullptr : spParams.get());
-    if (FAILED(hr))
-    {
-        return ImportFailure(hr);
-    }
+    IfFailedReturn(spFunctionType->InternalSetParameterTypes(paramCount, spParams.get()));
 
     *pBuilderId = spFunctionType->InternalGetId();
     return hr;
@@ -1191,16 +1266,24 @@ HRESULT SymbolImporter_DbgHelp::ImportTypeSymbol(_In_ ULONG symIndex, _Out_ ULON
             // Make sure there is *NOT* a naming conflict on this particular type.  Maybe someone already created
             // this type explicitly before we tried to import anything...
             //
-            ULONG64 builderId;
-            HRESULT hrFind = m_pOwningSet->FindTypeByName(pSymName, &builderId, nullptr, false);
-            if (SUCCEEDED(hrFind))
+            // Note that we must *NOT* do this for "unnamed symbols" which were given an explicit "<unnamed-*>" by
+            // something else.  These are *NOT* unique and you cannot ever look up <unnamed-*> and expect to get
+            // something meaningful.
+            //
+            bool isUnnamedTag = (wcsncmp(pSymName, L"<unnamed-", 9) == 0 && pSymName[wcslen(pSymName) - 1] == L'>');
+            if (!isUnnamedTag)
             {
-                //
-                // At this point, we have a naming conflict.  We can either fail to import this or just point to the
-                // existing type.  Here, we choose the latter.
-                //
-                *pBuilderId = builderId;
-                return S_FALSE;
+                ULONG64 builderId;
+                HRESULT hrFind = m_pOwningSet->FindTypeByName(pSymName, &builderId, nullptr, false);
+                if (SUCCEEDED(hrFind))
+                {
+                    //
+                    // At this point, we have a naming conflict.  We can either fail to import this or just point to the
+                    // existing type.  Here, we choose the latter.
+                    //
+                    *pBuilderId = builderId;
+                    return S_FALSE;
+                }
             }
         }
     }
@@ -1331,14 +1414,29 @@ bool SymbolImporter_DbgHelp::LegacyReadMemory(_Inout_ IMAGEHLP_CBA_READ_MEMORY *
 {
     auto pOwningProcess = m_pOwningSet->GetOwningProcess();
     auto pVirtualMemory = pOwningProcess->GetVirtualMemory();
+    bool isKernel = pOwningProcess->IsKernel();
     ULONG64 processKey = pOwningProcess->GetProcessKey();
 
-    ComPtr<ISvcProcess> spProcess;
+    //
+    // If we have a generalized view of the kernel and not a specific "process context", we can go and ask
+    // for the generalized kernel address context in which to perform any memory reads.
+    //
     ComPtr<ISvcAddressContext> spAddrCtx;
-    if (FAILED(pOwningProcess->GetSymbolBuilderManager()->ProcessKeyToProcess(processKey, &spProcess)) ||
-        FAILED(spProcess.As(&spAddrCtx)))
+    if (isKernel && processKey == 0)
     {
-        return false;
+        if (FAILED(pOwningProcess->GetSymbolBuilderManager()->GetKernelAddressContext(&spAddrCtx)))
+        {
+            return false;
+        }
+    }
+    else
+    {
+        ComPtr<ISvcProcess> spProcess;
+        if (FAILED(pOwningProcess->GetSymbolBuilderManager()->ProcessKeyToProcess(processKey, &spProcess)) ||
+            FAILED(spProcess.As(&spAddrCtx)))
+        {
+            return false;
+        }
     }
 
     ULONG64 bytesRead;

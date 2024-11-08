@@ -49,6 +49,14 @@ const PCWSTR exdiComponentFunctionList[] =
 LPCSTR const g_RequestGdbReadFeatureFile = "qXfer:features:read:";
 
 //
+//  Request PA memory access mode
+//
+LPCSTR const g_RequestGdbSetReadPAmode = "qqemu.PhyMemMode";
+LPCSTR const g_RequestGdbSetWritePAmode = "Qqemu.PhyMemMode";
+
+//  Server Name that supports configurable memory access mode (PAs vs VAs)
+LPCWSTR const g_GdbSrvConfigMemAccessMode = L"QEMU";
+//
 //  Set of internal Exdi commands that are not sent to the GDB server,
 //  so these commands are processed offline, and they are accessible via 
 // .exdicmd debugger command.
@@ -63,6 +71,12 @@ LPCSTR const g_GdbSrvGeneric = "GdbSrv-Generic";
 LPCWSTR const g_GdbSrvPrintSystemRegs = L"info registers system";
 LPCWSTR const g_GdbSrvPrintSystemRegsVerbose = L"info registers system -v";
 LPCWSTR const g_GdbSrvPrintCoreRegs = L"info registers core";
+
+//  Set Memory Mode on specific servers
+LPCWSTR const g_GdbSrvSetPAMemoryMode = L"SetPAMemoryMode";
+
+//  Server Name that supports only memory request mode via PAa
+LPCWSTR const g_GdbSrvPaMemoryMode = L"BMC-SMM";
 
 //  Header for the verbose command
 PCSTR const g_headerRegisterVerbose[] =
@@ -89,7 +103,9 @@ public:
         m_targetProcessorFamilyArch(PROCESSOR_FAMILY_UNK),
         m_ThreadStartIndex(-1),
         m_pRspClient(std::unique_ptr <GdbSrvRspClient<TcpConnectorStream>>
-            (new (std::nothrow) GdbSrvRspClient<TcpConnectorStream>(coreNumberConnectionParameters)))
+            (new (std::nothrow) GdbSrvRspClient<TcpConnectorStream>(coreNumberConnectionParameters))),
+        m_IsForcedPAMemoryMode(false),
+        m_ConfigPAMemMode(false)
     {
         m_cachedKPCRStartAddress.clear();
         m_targetProcessorIds.clear();
@@ -187,8 +203,17 @@ public:
             dataBuffer.insert(dataBuffer.end(), 1, NumberToAciiHex((pMonitorCmd[idx] & 0xf)));
         }
 
-        std::string commandMonitor("qRcmd,");
-        commandMonitor += dataBuffer.c_str();
+        std::string commandMonitor;
+        if (strstr(pMonitorCmd, g_RequestGdbSetReadPAmode) != nullptr ||
+            strstr(pMonitorCmd, g_RequestGdbSetWritePAmode) != nullptr)
+        {
+            commandMonitor += pMonitorCmd;
+        }
+        else
+        {
+            commandMonitor += "qRcmd,";
+            commandMonitor += dataBuffer.c_str();
+        }
 
         std::string reply = ExecuteCommandOnProcessor(commandMonitor.c_str(), true, 0, core);
         size_t messageLength = reply.length();
@@ -199,6 +224,7 @@ public:
             throw _com_error(E_FAIL);
         }
 
+        ConfigExdiGdbServerHelper& cfgData = ConfigExdiGdbServerHelper::GetInstanceCfgExdiGdbServer(nullptr);
         messageLength = min(messageLength, C_MAX_MONITOR_CMD_BUFFER);
         bool replyDone = false;
         do
@@ -225,15 +251,23 @@ public:
                     unsigned char highByte = ((AciiHexToNumber(reply[pos]) << 4) & 0xf0);
                     monitorResult[monitorResult.GetLength() - 1] = highByte | (AciiHexToNumber(reply[pos + 1]) & 0x0f);
                 }
-                //  Try to read more packets
-                bool IsPollingChannelMode = false;
-                if (m_pRspClient->ReceiveRspPacketEx(reply, core, true, IsPollingChannelMode, false))
+
+                if (cfgData.IsGdbMonitorCmdDoNotWaitOnOKEnable())
                 {
-                    messageLength = reply.length();
+                    replyDone = true;
                 }
                 else
                 {
-                    replyDone = true;
+                    //  Try to read more packets
+                    bool IsPollingChannelMode = false;
+                    if (m_pRspClient->ReceiveRspPacketEx(reply, core, true, IsPollingChannelMode, false))
+                    {
+                        messageLength = reply.length();
+                    }
+                    else
+                    {
+                        replyDone = true;
+                    }
                 }
             }
         }
@@ -513,6 +547,11 @@ public:
             {
                 HandleTargetDescriptionPacket(cfgData);
             }
+            else if (cfgData.IsSystemRegistersAvailable())
+            {
+                //  Get the actual system register vector from the table.
+                cfgData.GetGdbServerSystemRegisters(&m_spSystemRegisterVector);
+            }
 
             //  Enable extended features that are no advertised by the qSupported GDB server response,
             //  it's needed to read system registers/ARM64 CP15 registers in such GDB servers w/o
@@ -523,6 +562,22 @@ public:
                 //  Enable accessing target system register
                 m_pRspClient->SetFeatureEnable(PACKET_READ_OPENOCD_SPECIAL_REGISTER);
                 m_pRspClient->SetFeatureEnable(PACKET_WRITE_OPENOCD_SPECIAL_REGISTER);
+
+            } else {
+
+                wstring targetName;
+                cfgData.GetGdbServerTargetName(targetName);
+                if (_wcsicmp(targetName.c_str(), g_GdbSrvPaMemoryMode) == 0)
+                {
+                    //  Enable accessing target system register
+                    m_pRspClient->SetFeatureEnable(PACKET_READ_BMC_SMM_PA_MEMORY);
+                    m_pRspClient->SetFeatureEnable(PACKET_WRITE_BMC_SMM_PA_MEMORY);
+                }
+                else if (_wcsicmp(targetName.c_str(), g_GdbSrvConfigMemAccessMode) == 0)
+                {
+                    //  Enable accessing target system register
+                    m_pRspClient->SetFeatureEnable(PACKET_CONFIG_PA_MEMORY_MODE);
+                }
             }
         }
         return IsSetFeatureSucceeded;
@@ -1319,6 +1374,10 @@ public:
         }
 
         PCSTR pFormat = GetReadMemoryCmd(memType);
+        if (pFormat == nullptr)
+        {
+            throw _com_error(E_UNEXPECTED);
+        }
         unique_ptr<wchar_t> pWideFormat(new (nothrow) wchar_t[strlen(pFormat) + 1]);
         if (pWideFormat == nullptr)
         {
@@ -1533,29 +1592,48 @@ public:
             throw _com_error(E_OUTOFMEMORY);
         }
 
-        ConfigExdiGdbServerHelper & cfgData = ConfigExdiGdbServerHelper::GetInstanceCfgExdiGdbServer(nullptr);
+        //
+        // The maxPacketLength is the maximum PACKET length of an RSP packet, not how much memory we can push
+        // across.  At worst, the memory encodes each byte as two characters (hex) plus the packet overhead.
+        // All read requests need to be clamped to that size.
+        //
+        ConfigExdiGdbServerHelper& cfgData = ConfigExdiGdbServerHelper::GetInstanceCfgExdiGdbServer(nullptr);
         size_t maxPacketLength = cfgData.GetMaxServerPacketLength();
-        if (maxPacketLength != 0)
+        
+        //
+        // Add the $ #<2 byte checksum>
+        //
+        constexpr size_t packetOverhead = 4;
+        if (maxPacketLength == 0)
         {
-            maxPacketLength = (maxPacketLength < maxSize) ? maxPacketLength : maxSize;
+            maxPacketLength = maxSize * 2 + packetOverhead;
         }
-        else
-        {
-            maxPacketLength = maxSize;
-        }
+
         //  We need to support local configuration maximum packet size and packetsize that 
         //  the GdbServer dynamically supports by sending chunk of data until we reach the maximum requested size.
         while (maxSize != 0)
         {
-            size_t recvLength = 0;
             bool fError = false;
-            size_t size = maxPacketLength; 
-            //  We will send a sequence of ‘m addr,length’ request packets
+
+            size_t requestSize = (maxPacketLength - packetOverhead) / 2;
+            if (requestSize > maxSize)
+            {
+                requestSize = maxSize;
+            }
+            size_t size = requestSize;
+
+            //  We will send a sequence of ?m addr,length? request packets
             //  until we obtain the requested data length from the GdbServer.
             for (;;)
             {
-                char memoryCmd[256] = {0}; 
+                size_t recvLength = 0;
+                char memoryCmd[256] = { 0 };
                 PCSTR pFormat = GetReadMemoryCmd(memType);
+                if (pFormat == nullptr)
+                {
+                    throw _com_error(E_UNEXPECTED);
+                }
+
                 sprintf_s(memoryCmd, _countof(memoryCmd), pFormat, address, size);
                 std::string reply = ExecuteCommandEx(memoryCmd, true, maxReplyLength);
 
@@ -1578,7 +1656,7 @@ public:
                     //  and let the caller's handles the returned data.
                     fError = true;
                     //  unless we didn't read anything, in which case fail
-                    if (recvLength == 0 && GetThrowExceptionEnabled())
+                    if (result.GetLength() == 0 && GetThrowExceptionEnabled())
                     {
                         throw _com_error(E_FAIL);
                     }
@@ -1586,7 +1664,7 @@ public:
                 }
 
                 //  Handle the received memory data
-                for (size_t pos = 0; pos < messageLength ; pos += 2)
+                for (size_t pos = 0; pos < messageLength; pos += 2)
                 {
                     std::string oneByteMemory = reply.substr(pos, 2);
                     int value = 0;
@@ -1612,8 +1690,7 @@ public:
             {
                 break;
             }
-            maxSize -= maxPacketLength;
-            maxPacketLength = (maxPacketLength >= maxSize) ? maxSize : maxPacketLength; 
+            maxSize -= requestSize;
         }
         return result;
     }
@@ -1820,7 +1897,7 @@ public:
                     }
                 }
                 while(reply.find("l") == string::npos && countOfThreads != 0);
-            
+
                 m_cachedProcessorCount = (countOfThreads > 0) ? countOfThreads : 1;
                 assert(m_cachedProcessorCount == m_targetProcessorIds.size());
             }
@@ -2419,6 +2496,170 @@ public:
         m_pRspClient->SetInterrupt();
     }
 
+    bool GdbSrvControllerImpl::GetPAMemoryMode() const
+    {
+        return m_IsForcedPAMemoryMode;
+    }
+
+    void GdbSrvControllerImpl::SetPAMemoryMode(_In_ bool value)
+    {
+        m_IsForcedPAMemoryMode = value;
+    }
+
+    bool GdbSrvControllerImpl::GetConfigPAMemoryMode() const
+    {
+        return m_ConfigPAMemMode;
+    }
+
+    void GdbSrvControllerImpl::SetConfigPAMemoryMode(_In_ bool value)
+    {
+        m_ConfigPAMemMode = value;
+    }
+
+    bool GdbSrvControllerImpl::GetDynConfigPAMemCommandMode() const
+    {
+        return m_pRspClient->IsFeatureEnabled(PACKET_CONFIG_PA_MEMORY_MODE);
+    }
+
+    PCSTR GetSrvDynamicPAConfigModeCmd(_In_ bool mode)
+    {
+        PCSTR pFormat = nullptr;
+
+        if (GetDynConfigPAMemCommandMode())
+        {
+            // The QEMU server is the only GDB server that
+            // supports this mode to access PAs, other servers
+            // have customized commands to access PAs.
+            pFormat = QEMUDGdbServerMemoryHelpers::GetDynPAConfigModeCmd(mode);
+        }
+        else if (m_pRspClient->IsFeatureEnabled(PACKET_READ_BMC_SMM_PA_MEMORY))
+        {
+            // BMC-SMM server also support since this GDB server stub mimics
+            // QEMU GDB server.
+            pFormat = BmcSmmDGdbServerMemoryHelpers::GetDynPAConfigModeCmd(mode);
+        }
+        return pFormat;
+    }
+
+    SimpleCharBuffer SetPhysicalReadMemoryModeEx(_In_ bool setMode)
+    {
+
+        SimpleCharBuffer monitorResult;
+        if (!monitorResult.TryEnsureCapacity(C_MAX_MONITOR_CMD_BUFFER))
+        {
+            throw _com_error(E_OUTOFMEMORY);
+        }
+
+        ConfigExdiGdbServerHelper& cfgData = ConfigExdiGdbServerHelper::GetInstanceCfgExdiGdbServer(nullptr);
+        wstring wGdbServerTarget;
+        cfgData.GetGdbServerTargetName(wGdbServerTarget);
+        using convert_type = std::codecvt_utf8<wchar_t>;
+        std::wstring_convert<convert_type, wchar_t> converter;
+        const std::string sGdbServerTarget = converter.to_bytes(wGdbServerTarget);
+        if (sGdbServerTarget.empty())
+        {
+            throw _com_error(E_FAIL);
+        }
+
+        if (!cfgData.GetServerRequirePAMemoryAccess() && !GetDynConfigPAMemCommandMode())
+        {
+            throw _com_error(E_FAIL);
+        }
+
+        // Set the memory command to access via PA memory
+        std::string commandMonitor(GetSrvDynamicPAConfigModeCmd(setMode));
+        if (commandMonitor.empty())
+        {
+            throw _com_error(E_UNEXPECTED);
+        }
+
+        std::string reply = ExecuteCommandOnProcessor(commandMonitor.c_str(), true, 0, 0);
+        size_t messageLength = reply.length();
+
+        //  Is an empty response or an error response 'E NN'?
+        if (messageLength == 0 || IsReplyError(reply))
+        {
+            throw _com_error(E_FAIL);
+        }
+
+        messageLength = min(messageLength, C_MAX_MONITOR_CMD_BUFFER);
+        bool replyDone = false;
+        do
+        {
+            if (IsReplyOK(reply))
+            {
+                monitorResult.SetLength(monitorResult.GetLength() + messageLength);
+                memcpy(&monitorResult[monitorResult.GetLength() - messageLength], reply.c_str(), messageLength);
+                replyDone = true;
+                if (!GetDynConfigPAMemCommandMode())
+                {
+                    SetPAMemoryMode(true);
+                }
+            }
+            else
+            {
+                if (messageLength >= (monitorResult.GetCapacity() - (monitorResult.GetLength() + 1)))
+                {
+                    if (!monitorResult.TryEnsureCapacity((monitorResult.GetLength() + 1) + (4 * C_MAX_MONITOR_CMD_BUFFER)))
+                    {
+                        throw _com_error(E_OUTOFMEMORY);
+                    }
+                }
+                size_t pos = (reply[0] == 'O') ? 1 : 0;
+                for (; pos < messageLength; pos += 2)
+                {
+                    monitorResult.SetLength(monitorResult.GetLength() + 1);
+                    unsigned char highByte = ((AciiHexToNumber(reply[pos]) << 4) & 0xf0);
+                    monitorResult[monitorResult.GetLength() - 1] = highByte | (AciiHexToNumber(reply[pos + 1]) & 0x0f);
+                }
+                //  Try to read more packets
+                bool IsPollingChannelMode = false;
+                if (m_pRspClient->ReceiveRspPacketEx(reply, 0, true, IsPollingChannelMode, false))
+                {
+                    messageLength = reply.length();
+                }
+                else
+                {
+                    replyDone = true;
+                }
+            }
+        } while (!replyDone);
+
+        return monitorResult;
+    }
+
+
+    void HandleConfigPAMemAccessMode(_In_ memoryAccessType memType, _In_ bool setMode)
+    {
+        if (memType.isPhysical && GetDynConfigPAMemCommandMode() &&
+            !m_pRspClient->IsFeatureEnabled(PACKET_READ_BMC_SMM_PA_MEMORY))
+        {
+            if (setMode && GetConfigPAMemoryMode())
+            {
+                // To avoid sending the config. mode multiple time if it's already set
+                // the mode has to be cleared first to be able to set again.
+                return;
+            }
+            // Set the config PA mode
+            SimpleCharBuffer rspConfigPAMemMode = SetPhysicalReadMemoryModeEx(setMode);
+            std::string rspConfigPAMemModeStr(rspConfigPAMemMode.GetInternalBuffer(), rspConfigPAMemMode.GetEndOfData());
+            std::size_t pos = rspConfigPAMemModeStr.find("OK");
+            if (pos == string::npos)
+            {
+                throw _com_error(E_FAIL);
+            }
+
+            if (setMode)
+            {
+                SetConfigPAMemoryMode(true);
+            }
+            else
+            {
+                SetConfigPAMemoryMode(false);
+            }
+        }
+    }
+
     private:
     IGdbSrvTextHandler * m_pTextHandler;
     unsigned m_cachedProcessorCount;
@@ -2449,6 +2690,8 @@ public:
     unique_ptr<vector<RegistersStruct>> m_spRegisterVector;
     unique_ptr<vector<RegistersStruct>> m_spSystemRegisterVector;
     unique_ptr<SystemRegistersMapType> m_spSystemRegAccessCodeMap;
+    bool m_IsForcedPAMemoryMode;
+    bool m_ConfigPAMemMode;
 
     const_regIterator RegistersBegin(_In_ RegisterGroupType type = CORE_REGS) const {return (type == CORE_REGS) ? m_spRegisterVector->begin() : m_spSystemRegisterVector->begin();}
     const_regIterator RegistersEnd(_In_ RegisterGroupType type = CORE_REGS) const {return (type == CORE_REGS) ? m_spRegisterVector->end() : m_spSystemRegisterVector->end();}
@@ -2503,6 +2746,8 @@ public:
                 std::bind(&GdbSrvControllerImpl::PrintSystemRegistersVerbose, this);
             _m_InternalGdbFunctions[TargetArchitectureHelpers::WMakeLowerCase(g_GdbSrvPrintCoreRegs)] =
                 std::bind(&GdbSrvControllerImpl::PrintCoreRegisters, this);
+            _m_InternalGdbFunctions[TargetArchitectureHelpers::WMakeLowerCase(g_GdbSrvSetPAMemoryMode)] =
+                std::bind(&GdbSrvControllerImpl::SetPhysicalReadMemoryMode, this);
             return _m_InternalGdbFunctions;
         }();
     }
@@ -2542,6 +2787,11 @@ public:
             pStrGdbSrvType, gdbSrvStrTypeLength);
 
         return monitorResult;
+    }
+
+    SimpleCharBuffer GdbSrvControllerImpl::SetPhysicalReadMemoryMode()
+    {
+        return SetPhysicalReadMemoryModeEx(true);
     }
 
     inline AddressType GetAccessCodeByRegisterNumber(_In_ const string & regOrder)
@@ -2796,6 +3046,13 @@ public:
             pFormat = OpenOCDGdbServerMemoryHelpers::GetGdbSrvReadMemoryCmd(
                 memType, Is64BitArchitecture());
         }
+        else if (m_pRspClient->IsFeatureEnabled(PACKET_READ_BMC_SMM_PA_MEMORY) &&
+            !GetPAMemoryMode())
+        {
+            // It's an BMC-SMM server request
+            pFormat = BmcSmmDGdbServerMemoryHelpers::GetGdbSrvReadMemoryCmd(
+                memType, Is64BitArchitecture());
+        }
         else
         {
              pFormat = Is64BitArchitecture() ? "m%I64x,%x" : "m%x,%x";
@@ -2817,6 +3074,12 @@ public:
         else if (m_pRspClient->IsFeatureEnabled(PACKET_WRITE_OPENOCD_SPECIAL_REGISTER))
         {
             pFormat = OpenOCDGdbServerMemoryHelpers::GetGdbSrvWriteMemoryCmd(
+                memType, Is64BitArchitecture());
+        }
+        else if (m_pRspClient->IsFeatureEnabled(PACKET_WRITE_BMC_SMM_PA_MEMORY))
+        {
+            // It's an BMC-SMM server request
+            pFormat = BmcSmmDGdbServerMemoryHelpers::GetGdbSrvWriteMemoryCmd(
                 memType, Is64BitArchitecture());
         }
         else
@@ -3364,3 +3627,20 @@ void GdbSrvController::SetSystemRegisterXmlFile(PCWSTR pSystemRegFilePath)
     m_pGdbSrvControllerImpl->SetSystemRegisterXmlFile(pSystemRegFilePath);
 }
 
+bool GdbSrvController::GetPAMemoryMode()
+{
+    assert(m_pGdbSrvControllerImpl != nullptr);
+    return m_pGdbSrvControllerImpl->GetPAMemoryMode();
+}
+
+void GdbSrvController::HandleConfigPAMemAccessMode(_In_ memoryAccessType memType, _In_ bool setMode)
+{
+    assert(m_pGdbSrvControllerImpl != nullptr);
+    return m_pGdbSrvControllerImpl->HandleConfigPAMemAccessMode(memType, setMode);
+}
+
+bool GdbSrvController::GetDynConfPAGdbMemCmdMode()
+{
+    assert(m_pGdbSrvControllerImpl != nullptr);
+    return m_pGdbSrvControllerImpl->GetDynConfigPAMemCommandMode();
+}
